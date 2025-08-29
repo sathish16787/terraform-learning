@@ -1,21 +1,14 @@
-/*
-provider "aws" {
-  region = "ap-southeast-1"
-}
-*/
-
 resource "aws_launch_template" "example" {
   name_prefix = "terraform-example-"
-  image_id = "ami-08b138b7cf65145b1"
-  instance_type = "t2.micro"
+  image_id = var.image_id
+  instance_type = var.instance_type
   vpc_security_group_ids = [aws_security_group.instance.id] 
 
-user_data = base64encode(<<-EOF
-  #!/bin/bash
-  echo "Hello, World" > index.xhtml
-  nohup busybox httpd -f -p ${var.server_port} &
-EOF
-)
+user_data = base64encode(templatefile("user-data.sh",{
+  server_port = var.server_port
+  db_address = data.terraform_remote_state.db.outputs.address
+  db_port = data.terraform_remote_state.db.outputs.port
+}))
   
   lifecycle {
     create_before_destroy = true  
@@ -24,24 +17,23 @@ EOF
 
 resource "aws_autoscaling_group" "example" {
   vpc_zone_identifier = data.aws_subnets.k8s_vpc.ids
-  target_group_arns = [aws_lb_target_group.asg.arn]
-  health_check_type = "ELB"
-  
+  target_group_arns   = [aws_lb_target_group.asg.arn]
+  health_check_type   = "ELB"
+
   desired_capacity = 2
   min_size         = 2
   max_size         = 5
 
   launch_template {
-      id = aws_launch_template.example.id
-      version = "$Latest"
+    id      = aws_launch_template.example.id
+    version = "$Latest"
   }
 
   tag {
-    key = "Name"
-    value = "terraform-asg-example"
+    key                 = "Name"
+    value               = "terraform-asg-example"
     propagate_at_launch = true
   }
-
 }
 
 resource "aws_security_group" "instance" {
@@ -68,25 +60,27 @@ resource "aws_vpc_security_group_ingress_rule" "instance_ipv4" {
 resource "aws_lb" "example" {
   name = "terraform-asg-example"
   load_balancer_type = "application"
-  subnets = [element(data.aws_subnets.k8s_vpc.ids, 0), element(data.aws_subnets.k8s_vpc.ids, 1)]
-  security_groups = [aws_security_group.alb.id]
+  subnets            = data.aws_subnets.k8s_vpc.ids
+  security_groups    = [aws_security_group.alb.id]
+  #subnets = [element(data.aws_subnets.k8s_vpc.ids, 0), element(data.aws_subnets.k8s_vpc.ids, 1)]
+  #security_groups = [aws_security_group.alb.id]
 }
 
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.example.arn
-  port = 80
-  protocol = "HTTP"
+  port              = 80
+  protocol          = "HTTP"
 
-  default_action  {
-    type = "fixed-response"
-
-    fixed_response {
-      content_type = "text/plain"
-      message_body = "404: page not found"
-      status_code = 404
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.asg.arn
     }
+
+      lifecycle {
+    prevent_destroy = false
   }
-}
+  }
+
 
 resource "aws_security_group" "alb" {
   name        = "terraform-example-alb"
@@ -101,9 +95,9 @@ resource "aws_security_group" "alb" {
 resource "aws_vpc_security_group_ingress_rule" "alb_ipv4" {
   security_group_id = aws_security_group.alb.id
   cidr_ipv4         = "0.0.0.0/0"
-  from_port         = var.server_port
+  from_port         = 80
   ip_protocol       = "tcp"
-  to_port           = var.server_port
+  to_port           = 80
 }
 
 resource "aws_lb_target_group" "asg" {
@@ -122,33 +116,8 @@ health_check {
 }
 }
 
-resource "aws_lb_listener_rule" "asg" {
-listener_arn = aws_lb_listener.http.arn
-priority = 100
-condition {
-path_pattern {
-values = ["*"]
-}
-}
-action {
-type = "forward"
-target_group_arn = aws_lb_target_group.asg.arn
-}
-}
 
 
-
-variable "server_port" {
-  description = "The port the server will use for HTTP requests"
-  type = number
-  default = 8080
-}
-
-
-output "alb_dns_name" {
-value = aws_lb.example.dns_name
-description = "The domain name of the load balancer"
-}
 
 data "aws_vpc" "k8s_vpc" {
   filter {
@@ -163,4 +132,19 @@ data "aws_subnets" "k8s_vpc" {
     name   = "vpc-id"
     values = [data.aws_vpc.k8s_vpc.id]
   }
+
+    filter {
+    name   = "tag:Name"
+    values = ["k8s-vpc-public-0", "k8s-vpc-public-1"]
+  }
+}
+
+
+data "terraform_remote_state" "db" {
+backend = "s3"
+config = {
+bucket = "random-tf-test"
+key = "stage/data-store/mysql/terraform.tfstate"
+region = "ap-southeast-1"
+}
 }
